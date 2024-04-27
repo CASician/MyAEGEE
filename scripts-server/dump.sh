@@ -9,26 +9,7 @@
 # This makes the script swarm compatible as the databases don't necessarily
 #   need to live on the same host.
 
-#to get postgres version programmatically (wip): docker ps | grep postgres | awk '{print $2}'
-# NB weak because every ms may have a different version of postgres
-POSTGRES_VERSION="10.21"
-#shellcheck disable=SC2207
-POSTGRES_DETECTED=( $(docker ps | grep postgres | awk '{print $2}') )
-
-stringContain() { case $2 in *$1* ) return 0;; *) return 1;; esac ;}
-
-for PG in "${POSTGRES_DETECTED[@]}"; do
-  if stringContain "$POSTGRES_VERSION" "$PG"; then
-      printf 'Match: %-12s %s\n' "'$PG'" "'$POSTGRES_VERSION'"
-  else
-      printf 'No match: %s\n' "'$POSTGRES_VERSION'"
-      echo "We assume version of postgres ${POSTGRES_VERSION} but there's a mismatch with ${PG}"
-      echo "Have a manual check, fix, and retry"
-      exit 0
-  fi
-done
-
-RESTORE_REFERENCE_URL="https://github.com/AEGEE/MyAEGEE/blob/stable/scripts"
+RESTORE_REFERENCE_URL="https://github.com/AEGEE/MyAEGEE/blob/master/scripts"
 BACKUP_REFERENCE_URL="https://myaegee.atlassian.net/wiki/spaces/AIT/pages/291897345/Using+backup+restore+scripts+for+MyAEGEE+data"
 
 #shellcheck disable=SC2206
@@ -45,7 +26,6 @@ tmp_dir="/tmp/myaegee-backup-$(date +%Y-%m-%d)"
 
 mkdir -p "${tmp_dir}"
 
-MAIN_DIR=$PWD # could be /opt/myaegee on prod and /vagrant in local
 SCRIPT_DIR=$(dirname "${0}")
 #shellcheck disable=SC2164
 cd "${backup_dir}"
@@ -53,7 +33,7 @@ cd "${backup_dir}"
 error=0
 
 #shellcheck disable=SC2046
-export $(grep -v '^#' ${MAIN_DIR}/.env | xargs -d '\n')
+export $(grep -v '^#' /opt/MyAEGEE/.env | xargs -d '\n')
 
 ## BACKING UP
 
@@ -61,7 +41,9 @@ export $(grep -v '^#' ${MAIN_DIR}/.env | xargs -d '\n')
 # For each host, spawn a container which will pull all information with pg_dumpall
 for host in ${postgres_hosts[*]}; do
   file="${tmp_dir}/postgres-${host}"
-  docker run --rm --name "${host}-backupper"  -t --network="OMS" -e "PGPASSWORD=${PW_POSTGRES:-5ecr3t}" "postgres:${POSTGRES_VERSION}" pg_dumpall -c -U postgres -h "${host}" > "${file}"
+  echo "${host}"
+  echo "$(echo ${host} | sed 's/postgres-//')"
+  docker run --rm --name "${host}-backupper"  -t --network="OMS" -e "PGPASSWORD=${PW_POSTGRES:-postgres}" postgres:10 pg_dump -c -U postgres -h "${host}" --inserts $(echo "${host}" | sed 's/postgres-//') > "${file}"
 
 #shellcheck disable=SC2086
   if [[ $(wc -c <${file}) -le 100 ]]
@@ -73,7 +55,7 @@ for host in ${postgres_hosts[*]}; do
 done
 
 # TODO: Loop through maria host
-# TODO: Loop through sqlite hosts (adopt the logic that as of now is on the makefile directly)
+# TODO: Loop through sqlite hosts
 # TODO: Loop through volumes (calling the external script)
 
 ## ARCHIVING
@@ -117,11 +99,13 @@ fi
 if [[ ! "$error" == "0" ]]
 then
   echo "$(date +%Y-%m-%dT%H:%M:%S) -- ERROR -- File:${output_file} ; Backup unsuccessful" | tee -a "${log_file}"
-  "${MAIN_DIR}/${SCRIPT_DIR}/notify.py" FAILURE
+  echo "./notify.sh FAILURE" >> /opt/MyAEGEE/scripts/thelog
+  ./notify.sh FAILURE >> /opt/MyAEGEE/scripts/thelog
   exit $error
 else
   echo "$(date +%Y-%m-%dT%H:%M:%S) -- INFO -- File:${output_file} ; Backup successful, everything written to ${output_file}" | tee -a "${log_file}"
-  "${MAIN_DIR}/${SCRIPT_DIR}/notify.py" SUCCESS
+  echo "$(pwd) also ./notify.sh SUCCESS" >> /opt/MyAEGEE/scripts/thelog
+  /opt/MyAEGEE/scripts/notify.sh SUCCESS >> /opt/MyAEGEE/scripts/thelog
 fi
 
 #TODO: rsync to bucket. Buckets are cheaper than HDD/SDD storage
