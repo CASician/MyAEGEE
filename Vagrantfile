@@ -1,13 +1,13 @@
 machine_name = "appserver.test"
-ip_address = "192.168.168.168"
+ip_address = "192.168.56.0"
 vm_box = "bento/ubuntu-18.04"
 
 Vagrant.configure("2") do |config|
-  #Machine name for Vagrant, and machine type
+  # Machine name for Vagrant, and machine type
   config.vm.define machine_name
   config.vm.box = vm_box
 
-  #Machine name for virtualbox, and RAM size
+  # Machine name for virtualbox, and RAM size
   config.vm.provider :virtualbox do |vb|
     vb.customize [
       "modifyvm", :id,
@@ -22,21 +22,26 @@ Vagrant.configure("2") do |config|
   ## Network configurations ##
   config.vm.hostname = machine_name
   config.vm.network :private_network, ip: ip_address
-  ## Port forwarding
-  #NOTE: there could be a different script that sets the resolv.conf and then
-  # calls vagrant up
-  #If you want to SSH from anywhere on the network (sshd) uncomment this
-  #config.vm.network :forwarded_port, guest: 22, host: 2222, host_ip: "127.0.0.1", id: "ssh", auto_correct: true
-  #In case somebody does not use "appserver" but "localhost" uncomment this
-  #config.vm.network :forwarded_port, guest: 80, host: 8888, id: "main", auto_correct: true
 
   ## Provisioning scripts ##
-  #make it work also when windows messes up the line ending
-  config.vm.provision "shell", inline: "apt-get install dos2unix -qq -y; cd /vagrant && dos2unix *.sh; dos2unix scripts-vagrant_provision/*.sh"
 
-  #nice-to-have prompt and completion
-  config.vm.provision "shell", inline: "dos2unix /vagrant/scripts-vagrant_provision/bashrc; cat /vagrant/scripts-vagrant_provision/bashrc > /home/vagrant/.bashrc"
+  # Fix line endings for scripts
+  config.vm.provision "shell", inline: <<-SHELL
+    apt-get update -qq
+    apt-get install -qq -y dos2unix build-essential nodejs npm
+    cd /vagrant
+    dos2unix *.sh
+    dos2unix scripts-vagrant_provision/*.sh
+  SHELL
 
+  # Nice-to-have prompt and completion
+  config.vm.provision "shell", inline: <<-SHELL
+    dos2unix /vagrant/scripts-vagrant_provision/bashrc
+    cp /vagrant/scripts-vagrant_provision/bashrc /home/vagrant/.bashrc
+    chown vagrant:vagrant /home/vagrant/.bashrc
+  SHELL
+
+  # Ansible playbook
   config.vm.provision "ansible" do |ansible|
     ansible.playbook = "scripts-vagrant_provision/provision.yml"
     ansible.compatibility_mode = "2.0"
@@ -44,9 +49,10 @@ Vagrant.configure("2") do |config|
     #ansible.tags = "docker"
   end
 
-  #provision docker orchestration (set to always run)
+  # Provision Docker orchestration (set to always run)
   config.vm.provision "shell", path: "scripts-vagrant_provision/orchestrate_docker.sh", run: "always"
 
+  # Post up message
   config.vm.post_up_message = "[FINALLY!] Setup is complete, open your browser to http://my.#{machine_name} (did you configure /etc/hosts via start.sh or manually?)"
 
   ## Deprovisioning scripts ##
