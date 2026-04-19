@@ -1,33 +1,2289 @@
 orbs:
-  shellcheck: circleci/shellcheck@3.2.0
-  docker: circleci/docker@2.7.1
+  codecov: codecov/codecov@5.4.3
+  node: circleci/node@7.2.1
+  shellcheck: circleci/shellcheck@3.4.0
+  slack: circleci/slack@6.1.2
 version: 2.1
 jobs:
   yamllint:
     docker:
-      - image: cimg/python:3.12.6
+      - image: cimg/python:3.13.11
     steps:
       - checkout
       - run: pip install yamllint
       - run: yamllint -d .yamllint.yml .
   pylint:
     docker:
-      - image: cimg/python:3.12.6
+      - image: cimg/python:3.13.11
     steps:
       - checkout
       - run: pip install pylint
       # FIXME: enable W0511 and E0401 as well
       - run: pylint scripts-server --disable C0114,C0116,W0511,E0401
+  hadolint:
+    docker:
+      - image: hadolint/hadolint:latest-alpine
+    steps:
+      - checkout
+      - run:
+          name: Lint Dockerfiles
+          command: hadolint $(find . -name '*Dockerfile*' -not -path './mailer/*')
   shellcheck:
     docker:
-      - image: cimg/base:2024.09
+      - image: cimg/base:2025.12
     steps:
       - checkout
       - shellcheck/install
-      - shellcheck/check:
-          exclude: SC2002,SC2086,SC2126,SC2154
+      - run:
+          name: Run shellcheck
+          command: |
+            shellcheck --exclude=SC2002,SC2086,SC2126,SC2154 $(find . -name '*.sh' -not -path '*/node_modules/*' -not -path './mailer/*' -type f)
+  core-test:
+    docker:
+      - image: cimg/node:22.22.0
+      - image: cimg/postgres:17.6
+        environment:
+          POSTGRES_PASSWORD: config.test.postgres.password
+    parallelism: 4
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/core
+          override-ci-command: npm ci --legacy-peer-deps
+      - run: mkdir -p ~/reports/jest
+      - run:
+          name: Run core tests
+          working_directory: ~/project/core
+          command: |
+            TEST=$(circleci tests glob test/**/*.js | circleci tests split --split-by=timings)
+            JEST_JUNIT_OUTPUT_DIR=$HOME/reports/jest npm run test:ci $TEST -- --reporters=default --reporters=jest-junit
+      - codecov/upload
+      - store_test_results:
+          path: ~/reports
+      - store_artifacts:
+          path: ~/reports
+  core-db-recreate:
+    docker:
+      - image: cimg/node:22.22.0
+      - image: cimg/postgres:17.6
+        environment:
+          POSTGRES_PASSWORD: config.test.postgres.password
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/core
+          override-ci-command: npm ci --legacy-peer-deps
+      - run:
+          name: Run core db:recreate
+          working_directory: ~/project/core
+          command: NODE_ENV=test npm run db:recreate
+  core-build:
+    docker:
+      - image: cimg/base:2025.12
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run: docker-compose -f core/docker/docker-compose.yml -f core/docker/docker-compose.dev.yml build --no-cache core
+  core-eslint:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/core
+          override-ci-command: npm ci --legacy-peer-deps
+      - run: mkdir -p ~/reports
+      - run:
+          name: Run core eslint
+          working_directory: ~/project/core
+          command: npm run lint -- --format junit --output-file ~/reports/eslint.xml
+      - store_test_results:
+          path: ~/reports
+      - store_artifacts:
+          path: ~/reports
+  core-audit:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Run core audit
+          working_directory: ~/project/core
+          command: npm audit --production
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: The audit check for core module in `$CIRCLE_PROJECT_REPONAME` has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  core-docker-build-and-push:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run:
+          name: Install monorepo workspace dependencies
+          command: npm install --ignore-scripts
+      - run:
+          name: Run semantic-release for core
+          working_directory: ~/project/core
+          command: npm run semantic-release
+      - run:
+          name: Set up Docker Buildx for multi-platform builds
+          command: |
+            docker buildx create --name multiarch --use
+            docker buildx inspect --bootstrap
+      - run:
+          name: Export PACKAGE_VERSION for core
+          command: echo "export PACKAGE_VERSION=$(git tag --list 'core@*' --sort=-v:refname | head -1 | sed 's/core@//')" >> "$BASH_ENV"
+      - run:
+          name: Build and push core Docker image (multi-platform)
+          working_directory: ~/project/core
+          command: |
+            printf '%s\n' "$DOCKER_PASSWORD" | docker login --username "$DOCKER_LOGIN" --password-stdin
+            # TODO: re-enable provenance and sbom once Docker has been updated
+            docker buildx build --provenance=false --sbom=false --platform linux/amd64,linux/arm64 \
+              --build-arg PACKAGE_VERSION=$PACKAGE_VERSION \
+              --tag aegee/core:$PACKAGE_VERSION \
+              --tag aegee/core:latest \
+              -f docker/core/Dockerfile \
+              --push .
+      - slack/notify:
+          event: pass
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: The Docker image for core module with tags `$PACKAGE_VERSION` and `latest` has been pushed to Dockerhub."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":octagonal_sign: The Docker image for core module build and push has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  discounts-test:
+    docker:
+      - image: cimg/node:22.22.0
+      - image: cimg/postgres:17.6
+        environment:
+          POSTGRES_PASSWORD: config.test.postgres.password
+    parallelism: 4
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/discounts
+          override-ci-command: npm ci --legacy-peer-deps
+      - run: mkdir -p ~/reports/jest
+      - run:
+          name: Run discounts tests
+          working_directory: ~/project/discounts
+          command: |
+            TEST=$(circleci tests glob test/api/*.js | circleci tests split --split-by=timings)
+            JEST_JUNIT_OUTPUT_DIR=$HOME/reports/jest npm run test:ci $TEST -- --reporters=default --reporters=jest-junit
+      - codecov/upload
+      - store_test_results:
+          path: ~/reports
+      - store_artifacts:
+          path: ~/reports
+  discounts-build:
+    docker:
+      - image: cimg/base:2025.12
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run: docker-compose -f discounts/docker/docker-compose.yml -f discounts/docker/docker-compose.dev.yml build --no-cache discounts
+  discounts-eslint:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/discounts
+          override-ci-command: npm ci --legacy-peer-deps
+      - run: mkdir -p ~/reports
+      - run:
+          name: Run discounts eslint
+          working_directory: ~/project/discounts
+          command: npm run lint -- --format junit --output-file ~/reports/eslint.xml
+      - store_test_results:
+          path: ~/reports
+      - store_artifacts:
+          path: ~/reports
+  discounts-audit:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Run discounts audit
+          working_directory: ~/project/discounts
+          command: npm audit --production
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: The audit check for discounts module in `$CIRCLE_PROJECT_REPONAME` has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  discounts-docker-build-and-push:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run:
+          name: Install monorepo workspace dependencies
+          command: npm install --ignore-scripts
+      - run:
+          name: Run semantic-release for discounts
+          working_directory: ~/project/discounts
+          command: npm run semantic-release
+      - run:
+          name: Set up Docker Buildx for multi-platform builds
+          command: |
+            docker buildx create --name multiarch --use
+            docker buildx inspect --bootstrap
+      - run:
+          name: Export PACKAGE_VERSION for discounts
+          command: echo "export PACKAGE_VERSION=$(git tag --list 'discounts@*' --sort=-v:refname | head -1 | sed 's/discounts@//')" >> "$BASH_ENV"
+      - run:
+          name: Build and push discounts Docker image (multi-platform)
+          working_directory: ~/project/discounts
+          command: |
+            printf '%s\n' "$DOCKER_PASSWORD" | docker login --username "$DOCKER_LOGIN" --password-stdin
+            # TODO: re-enable provenance and sbom once Docker has been updated
+            docker buildx build --provenance=false --sbom=false --platform linux/amd64,linux/arm64 \
+              --build-arg PACKAGE_VERSION=$PACKAGE_VERSION \
+              --tag aegee/discounts:$PACKAGE_VERSION \
+              --tag aegee/discounts:latest \
+              -f docker/discounts/Dockerfile \
+              --push .
+      - slack/notify:
+          event: pass
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: The Docker image for discounts module with tags `$PACKAGE_VERSION` and `latest` has been pushed to Dockerhub."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":octagonal_sign: The Docker image for discounts module build and push has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  events-test:
+    docker:
+      - image: cimg/node:22.22.0
+      - image: cimg/postgres:17.6
+        environment:
+          POSTGRES_PASSWORD: config.test.postgres.password
+    parallelism: 4
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/events
+          override-ci-command: npm ci --legacy-peer-deps
+      - run: mkdir -p ~/reports/jest
+      - run:
+          name: Run events tests
+          working_directory: ~/project/events
+          command: |
+            TEST=$(circleci tests glob test/**/*.js | circleci tests split --split-by=timings)
+            JEST_JUNIT_OUTPUT_DIR=$HOME/reports/jest npm run test:ci $TEST -- --reporters=default --reporters=jest-junit
+      - codecov/upload
+      - store_test_results:
+          path: ~/reports
+      - store_artifacts:
+          path: ~/reports
+  events-db-recreate:
+    docker:
+      - image: cimg/node:22.22.0
+      - image: cimg/postgres:17.6
+        environment:
+          POSTGRES_PASSWORD: config.test.postgres.password
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/events
+          override-ci-command: npm ci --legacy-peer-deps
+      - run:
+          name: Run events db:recreate
+          working_directory: ~/project/events
+          command: NODE_ENV=test npm run db:recreate
+  events-build:
+    docker:
+      - image: cimg/base:2025.12
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run: docker-compose -f events/docker/docker-compose.yml -f events/docker/docker-compose.dev.yml build --no-cache events
+  events-eslint:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/events
+          override-ci-command: npm ci --legacy-peer-deps
+      - run: mkdir -p ~/reports
+      - run:
+          name: Run events eslint
+          working_directory: ~/project/events
+          command: npm run lint -- --format junit --output-file ~/reports/eslint.xml
+      - store_test_results:
+          path: ~/reports
+      - store_artifacts:
+          path: ~/reports
+  events-audit:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Run events audit
+          working_directory: ~/project/events
+          command: npm audit --production
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: The audit check for events module in `$CIRCLE_PROJECT_REPONAME` has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  events-docker-build-and-push:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run:
+          name: Install monorepo workspace dependencies
+          command: npm install --ignore-scripts
+      - run:
+          name: Run semantic-release for events
+          working_directory: ~/project/events
+          command: npm run semantic-release
+      - run:
+          name: Set up Docker Buildx for multi-platform builds
+          command: |
+            docker buildx create --name multiarch --use
+            docker buildx inspect --bootstrap
+      - run:
+          name: Export PACKAGE_VERSION for events
+          command: echo "export PACKAGE_VERSION=$(git tag --list 'events@*' --sort=-v:refname | head -1 | sed 's/events@//')" >> "$BASH_ENV"
+      - run:
+          name: Build and push events Docker image (multi-platform)
+          working_directory: ~/project/events
+          command: |
+            printf '%s\n' "$DOCKER_PASSWORD" | docker login --username "$DOCKER_LOGIN" --password-stdin
+            # TODO: re-enable provenance and sbom once Docker has been updated
+            docker buildx build --provenance=false --sbom=false --platform linux/amd64,linux/arm64 \
+              --build-arg PACKAGE_VERSION=$PACKAGE_VERSION \
+              --tag aegee/events:$PACKAGE_VERSION \
+              --tag aegee/events:latest \
+              -f docker/events/Dockerfile \
+              --push .
+      - slack/notify:
+          event: pass
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: The Docker image for events module with tags `$PACKAGE_VERSION` and `latest` has been pushed to Dockerhub."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":octagonal_sign: The Docker image for events module build and push has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  frontend-build:
+    docker:
+      - image: cimg/base:2025.12
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run: docker-compose -f frontend/docker/docker-compose.yml -f frontend/docker/docker-compose.dev.yml build --no-cache frontend
+  frontend-eslint:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Install frontend dependencies (skip husky)
+          working_directory: ~/project/frontend
+          command: npm ci --legacy-peer-deps --ignore-scripts
+      - run: mkdir -p ~/reports
+      - run:
+          name: Run frontend eslint
+          working_directory: ~/project/frontend
+          command: npx eslint --ext .js,.vue . --format junit --output-file ~/reports/eslint.xml
+      - store_test_results:
+          path: ~/reports
+      - store_artifacts:
+          path: ~/reports
+  frontend-audit:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Run frontend audit
+          working_directory: ~/project/frontend
+          command: npm audit --production
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: The audit check for frontend module in `$CIRCLE_PROJECT_REPONAME` has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  frontend-docker-build-and-push:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run:
+          name: Install monorepo workspace dependencies
+          command: npm install --ignore-scripts
+      - run:
+          name: Run semantic-release for frontend
+          working_directory: ~/project/frontend
+          command: npm run semantic-release
+      - run:
+          name: Set up Docker Buildx for multi-platform builds
+          command: |
+            docker buildx create --name multiarch --use
+            docker buildx inspect --bootstrap
+      - run:
+          name: Export PACKAGE_VERSION for frontend
+          command: echo "export PACKAGE_VERSION=$(git tag --list 'frontend@*' --sort=-v:refname | head -1 | sed 's/frontend@//')" >> "$BASH_ENV"
+      - run:
+          name: Build and push frontend Docker image (multi-platform)
+          working_directory: ~/project/frontend
+          command: |
+            printf '%s\n' "$DOCKER_PASSWORD" | docker login --username "$DOCKER_LOGIN" --password-stdin
+            # TODO: re-enable provenance and sbom once Docker has been updated
+            docker buildx build --provenance=false --sbom=false --platform linux/amd64,linux/arm64 \
+              --build-arg PACKAGE_VERSION=$PACKAGE_VERSION \
+              --tag aegee/frontend:$PACKAGE_VERSION \
+              --tag aegee/frontend:latest \
+              -f docker/Dockerfile \
+              --push .
+      - slack/notify:
+          event: pass
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: The Docker image for frontend module with tags `$PACKAGE_VERSION` and `latest` has been pushed to Dockerhub."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":octagonal_sign: The Docker image for frontend module build and push has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  gsuite-wrapper-test:
+    docker:
+      - image: cimg/node:22.22.0
+      - image: cimg/redis:8.4.0
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Install gsuite-wrapper dependencies (skip husky)
+          working_directory: ~/project/gsuite-wrapper
+          command: npm ci --legacy-peer-deps --ignore-scripts
+      - run:
+          name: Setup gsuite-wrapper config files
+          working_directory: ~/project/gsuite-wrapper
+          command: |
+            echo $SERVICEACCOUNT_JSON > lib/config/myaegee-serviceaccount.json
+            echo $SECRETS_JSON > lib/config/secrets.json
+      - run: mkdir -p ~/reports/mocha
+      - run:
+          name: Run gsuite-wrapper tests
+          working_directory: ~/project/gsuite-wrapper
+          command: npm run test
+  gsuite-wrapper-build:
+    docker:
+      - image: cimg/base:2025.12
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run: docker-compose -f gsuite-wrapper/docker/docker-compose.yml -f gsuite-wrapper/docker/docker-compose.dev.yml build --no-cache gsuite-wrapper
+  gsuite-wrapper-eslint:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Install gsuite-wrapper dependencies (skip husky)
+          working_directory: ~/project/gsuite-wrapper
+          command: npm ci --legacy-peer-deps --ignore-scripts
+      - run: mkdir -p ~/reports
+      - run:
+          name: Run gsuite-wrapper eslint
+          working_directory: ~/project/gsuite-wrapper
+          command: npm run lint -- --format junit --output-file ~/reports/eslint.xml
+      - store_test_results:
+          path: ~/reports
+      - store_artifacts:
+          path: ~/reports
+  gsuite-wrapper-audit:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Run gsuite-wrapper audit
+          working_directory: ~/project/gsuite-wrapper
+          command: npm audit --production
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: The audit check for gsuite-wrapper module in `$CIRCLE_PROJECT_REPONAME` has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  gsuite-wrapper-docker-build-and-push:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run:
+          name: Install monorepo workspace dependencies
+          command: npm install --ignore-scripts
+      - run:
+          name: Run semantic-release for gsuite-wrapper
+          working_directory: ~/project/gsuite-wrapper
+          command: npm run semantic-release
+      - run:
+          name: Set up Docker Buildx for multi-platform builds
+          command: |
+            docker buildx create --name multiarch --use
+            docker buildx inspect --bootstrap
+      - run:
+          name: Export PACKAGE_VERSION for gsuite-wrapper
+          command: echo "export PACKAGE_VERSION=$(git tag --list 'gsuite-wrapper@*' --sort=-v:refname | head -1 | sed 's/gsuite-wrapper@//')" >> "$BASH_ENV"
+      - run:
+          name: Build and push gsuite-wrapper Docker image (multi-platform)
+          working_directory: ~/project/gsuite-wrapper
+          command: |
+            printf '%s\n' "$DOCKER_PASSWORD" | docker login --username "$DOCKER_LOGIN" --password-stdin
+            # TODO: re-enable provenance and sbom once Docker has been updated
+            docker buildx build --provenance=false --sbom=false --platform linux/amd64,linux/arm64 \
+              --build-arg PACKAGE_VERSION=$PACKAGE_VERSION \
+              --tag aegee/gsuite-wrapper:$PACKAGE_VERSION \
+              --tag aegee/gsuite-wrapper:latest \
+              -f docker/Dockerfile \
+              --push .
+      - slack/notify:
+          event: pass
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: The Docker image for gsuite-wrapper module with tags `$PACKAGE_VERSION` and `latest` has been pushed to Dockerhub."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":octagonal_sign: The Docker image for gsuite-wrapper module build and push has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  knowledge-test:
+    docker:
+      - image: cimg/node:22.22.0
+      - image: cimg/postgres:17.6
+        environment:
+          POSTGRES_PASSWORD: config.test.postgres.password
+    parallelism: 4
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/knowledge
+          override-ci-command: npm ci --legacy-peer-deps
+      - run: mkdir -p ~/reports/jest
+      - run:
+          name: Run knowledge tests
+          working_directory: ~/project/knowledge
+          command: |
+            TEST=$(circleci tests glob test/api/*.js | circleci tests split --split-by=timings)
+            JEST_JUNIT_OUTPUT_DIR=$HOME/reports/jest npm run test:ci $TEST -- --reporters=default --reporters=jest-junit
+      - codecov/upload
+      - store_test_results:
+          path: ~/reports
+      - store_artifacts:
+          path: ~/reports
+  knowledge-build:
+    docker:
+      - image: cimg/base:2025.12
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run: docker-compose -f knowledge/docker/docker-compose.yml -f knowledge/docker/docker-compose.dev.yml build --no-cache knowledge
+  knowledge-eslint:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/knowledge
+          override-ci-command: npm ci --legacy-peer-deps
+      - run: mkdir -p ~/reports
+      - run:
+          name: Run knowledge eslint
+          working_directory: ~/project/knowledge
+          command: npm run lint -- --format junit --output-file ~/reports/eslint.xml
+      - store_test_results:
+          path: ~/reports
+      - store_artifacts:
+          path: ~/reports
+  knowledge-audit:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Run knowledge audit
+          working_directory: ~/project/knowledge
+          command: npm audit --production
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: The audit check for knowledge module in `$CIRCLE_PROJECT_REPONAME` has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  knowledge-docker-build-and-push:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run:
+          name: Install monorepo workspace dependencies
+          command: npm install --ignore-scripts
+      - run:
+          name: Run semantic-release for knowledge
+          working_directory: ~/project/knowledge
+          command: npm run semantic-release
+      - run:
+          name: Set up Docker Buildx for multi-platform builds
+          command: |
+            docker buildx create --name multiarch --use
+            docker buildx inspect --bootstrap
+      - run:
+          name: Export PACKAGE_VERSION for knowledge
+          command: echo "export PACKAGE_VERSION=$(git tag --list 'knowledge@*' --sort=-v:refname | head -1 | sed 's/knowledge@//')" >> "$BASH_ENV"
+      - run:
+          name: Build and push knowledge Docker image (multi-platform)
+          working_directory: ~/project/knowledge
+          command: |
+            printf '%s\n' "$DOCKER_PASSWORD" | docker login --username "$DOCKER_LOGIN" --password-stdin
+            # TODO: re-enable provenance and sbom once Docker has been updated
+            docker buildx build --provenance=false --sbom=false --platform linux/amd64,linux/arm64 \
+              --build-arg PACKAGE_VERSION=$PACKAGE_VERSION \
+              --tag aegee/knowledge:$PACKAGE_VERSION \
+              --tag aegee/knowledge:latest \
+              -f docker/knowledge/Dockerfile \
+              --push .
+      - slack/notify:
+          event: pass
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: The Docker image for knowledge module with tags `$PACKAGE_VERSION` and `latest` has been pushed to Dockerhub."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":octagonal_sign: The Docker image for knowledge module build and push has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  mailer-test:
+    machine:
+      image: ubuntu-2204:2025.09.1
+    environment:
+      MIX_ENV: test
+      SMTP_USER: mailer@aegee.eu
+      SMTP_NAME: AEGEE <mailer@aegee.eu>
+      SMTP_PASSWORD: 5ecr3t
+      SMTP_HOST: mail.aegee.eu
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Install Elixir and Erlang for mailer
+          working_directory: ~/project/mailer
+          command: |
+            sudo apt-get update
+            sudo apt-get install elixir erlang
+      - run:
+          name: Setup mailer hex and rebar
+          working_directory: ~/project/mailer
+          command: |
+            mix local.hex --force
+            mix local.rebar --force
+      - run:
+          name: Get mailer dependencies
+          working_directory: ~/project/mailer
+          command: mix deps.get
+      - run:
+          name: Run mailer tests
+          working_directory: ~/project/mailer
+          command: SMTP_USER=mailer@aegee.eu mix coveralls
+  mailer-build:
+    docker:
+      - image: cimg/base:2025.12
+        environment:
+          MIX_ENV: test
+          SMTP_USER: mailer@aegee.eu
+          SMTP_NAME: AEGEE <mailer@aegee.eu>
+          SMTP_PASSWORD: 5ecr3t
+          SMTP_HOST: mail.aegee.eu
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run: docker-compose -f mailer/docker/docker-compose.yml -f mailer/docker/docker-compose.dev.yml build --no-cache mailer
+  mailer-docker-build-and-push:
+    docker:
+      - image: cimg/node:22.22.0
+    environment:
+      MIX_ENV: test
+      SMTP_USER: mailer@aegee.eu
+      SMTP_NAME: AEGEE <mailer@aegee.eu>
+      SMTP_PASSWORD: 5ecr3t
+      SMTP_HOST: mail.aegee.eu
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run:
+          name: Install monorepo workspace dependencies
+          command: npm install --ignore-scripts
+      - run:
+          name: Run semantic-release for mailer
+          working_directory: ~/project/mailer
+          command: npm run semantic-release
+      - run:
+          name: Set up Docker Buildx for multi-platform builds
+          command: |
+            docker buildx create --name multiarch --use
+            docker buildx inspect --bootstrap
+      - run:
+          name: Export PACKAGE_VERSION for mailer
+          command: echo "export PACKAGE_VERSION=$(git tag --list 'mailer@*' --sort=-v:refname | head -1 | sed 's/mailer@//')" >> "$BASH_ENV"
+      - run:
+          name: Build and push mailer Docker images (multi-platform)
+          working_directory: ~/project/mailer
+          command: |
+            printf '%s\n' "$DOCKER_PASSWORD" | docker login --username "$DOCKER_LOGIN" --password-stdin
+            # TODO: re-enable provenance and sbom once Docker has been updated
+            docker buildx build --provenance=false --sbom=false --platform linux/amd64,linux/arm64 \
+              --build-arg PACKAGE_VERSION=$PACKAGE_VERSION \
+              --tag aegee/mailer:$PACKAGE_VERSION \
+              --tag aegee/mailer:latest \
+              -f docker/mailer/Dockerfile \
+              --push .
+            # TODO: re-enable provenance and sbom once Docker has been updated
+            docker buildx build --provenance=false --sbom=false --platform linux/amd64,linux/arm64 \
+              --tag aegee/mail-transfer-agent:$PACKAGE_VERSION \
+              --tag aegee/mail-transfer-agent:latest \
+              -f docker/mail_transfer_agent/Dockerfile \
+              --push .
+      - slack/notify:
+          event: pass
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: The Docker image for mailer module with tags `$PACKAGE_VERSION` and `latest` has been pushed to Dockerhub."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":octagonal_sign: The Docker image for mailer module build and push has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  nginx-static-docker-build-and-push:
+    docker:
+      - image: cimg/base:2025.12
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run:
+          name: Set up Docker Buildx for multi-platform builds
+          command: |
+            docker buildx create --name multiarch --use
+            docker buildx inspect --bootstrap
+      - run:
+          name: Build and push nginx-static Docker image (multi-platform)
+          working_directory: ~/project
+          command: |
+            printf '%s\n' "$DOCKER_PASSWORD" | docker login --username "$DOCKER_LOGIN" --password-stdin
+            # TODO: re-enable provenance and sbom once Docker has been updated
+            docker buildx build --provenance=false --sbom=false --platform linux/amd64,linux/arm64 \
+              --tag aegee/nginx-static:1.28.1 \
+              --tag aegee/nginx-static:stable \
+              --tag aegee/nginx-static:latest \
+              -f docker/nginx-static/Dockerfile \
+              --push docker/nginx-static/
+      - slack/notify:
+          event: pass
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: The Docker image for nginx-static with tags `1.28.1`, `stable` and `latest` has been pushed to Dockerhub."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":octagonal_sign: The Docker image for nginx-static build and push has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  network-test:
+    docker:
+      - image: cimg/node:22.22.0
+      - image: cimg/postgres:16.10
+        environment:
+          POSTGRES_PASSWORD: config.test.postgres.password
+    parallelism: 4
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/network
+          override-ci-command: npm ci --legacy-peer-deps
+      - run: mkdir -p ~/reports/jest
+      - run:
+          name: Run network tests
+          working_directory: ~/project/network
+          command: |
+            TEST=$(circleci tests glob test/**/*.js | circleci tests split --split-by=timings)
+            JEST_JUNIT_OUTPUT_DIR=$HOME/reports/jest npm run test:ci $TEST -- --reporters=default --reporters=jest-junit
+      - codecov/upload
+      - store_test_results:
+          path: ~/reports
+      - store_artifacts:
+          path: ~/reports
+  network-build:
+    docker:
+      - image: cimg/base:2025.12
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run: docker-compose -f network/docker/docker-compose.yml -f network/docker/docker-compose.dev.yml build --no-cache network
+  network-eslint:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/network
+          override-ci-command: npm ci --legacy-peer-deps
+      - run: mkdir -p ~/reports
+      - run:
+          name: Run network eslint
+          working_directory: ~/project/network
+          command: npm run lint -- --format junit --output-file ~/reports/eslint.xml
+      - store_test_results:
+          path: ~/reports
+      - store_artifacts:
+          path: ~/reports
+  network-audit:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Run network audit
+          working_directory: ~/project/network
+          command: npm audit --production
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: The audit check for network module in `$CIRCLE_PROJECT_REPONAME` has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  network-docker-build-and-push:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run:
+          name: Install monorepo workspace dependencies
+          command: npm install --ignore-scripts
+      - run:
+          name: Run semantic-release for network
+          working_directory: ~/project/network
+          command: npm run semantic-release
+      - run:
+          name: Set up Docker Buildx for multi-platform builds
+          command: |
+            docker buildx create --name multiarch --use
+            docker buildx inspect --bootstrap
+      - run:
+          name: Export PACKAGE_VERSION for network
+          command: echo "export PACKAGE_VERSION=$(git tag --list 'network@*' --sort=-v:refname | head -1 | sed 's/network@//')" >> "$BASH_ENV"
+      - run:
+          name: Build and push network Docker image (multi-platform)
+          working_directory: ~/project/network
+          command: |
+            printf '%s\n' "$DOCKER_PASSWORD" | docker login --username "$DOCKER_LOGIN" --password-stdin
+            # TODO: re-enable provenance and sbom once Docker has been updated
+            docker buildx build --provenance=false --sbom=false --platform linux/amd64,linux/arm64 \
+              --build-arg PACKAGE_VERSION=$PACKAGE_VERSION \
+              --tag aegee/network:$PACKAGE_VERSION \
+              --tag aegee/network:latest \
+              -f docker/network/Dockerfile \
+              --push .
+      - slack/notify:
+          event: pass
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: The Docker image for network module with tags `$PACKAGE_VERSION` and `latest` has been pushed to Dockerhub."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":octagonal_sign: The Docker image for network module build and push has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  statutory-test:
+    docker:
+      - image: cimg/node:22.22.0
+      - image: cimg/postgres:17.6
+        environment:
+          POSTGRES_PASSWORD: config.test.postgres.password
+    parallelism: 4
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/statutory
+          override-ci-command: npm ci --legacy-peer-deps
+      - run: mkdir -p ~/reports/jest
+      - run:
+          name: Run statutory tests
+          working_directory: ~/project/statutory
+          command: |
+            TEST=$(circleci tests glob test/api/*.js | circleci tests split --split-by=timings)
+            JEST_JUNIT_OUTPUT_DIR=$HOME/reports/jest npm run test:ci $TEST -- --reporters=default --reporters=jest-junit
+      - codecov/upload
+      - store_test_results:
+          path: ~/reports
+      - store_artifacts:
+          path: ~/reports
+  statutory-build:
+    docker:
+      - image: cimg/base:2025.12
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run: docker-compose -f statutory/docker/docker-compose.yml -f statutory/docker/docker-compose.dev.yml build --no-cache statutory
+  statutory-eslint:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/statutory
+          override-ci-command: npm ci --legacy-peer-deps
+      - run: mkdir -p ~/reports
+      - run:
+          name: Run statutory eslint
+          working_directory: ~/project/statutory
+          command: npm run lint -- --format junit --output-file ~/reports/eslint.xml
+      - store_test_results:
+          path: ~/reports
+      - store_artifacts:
+          path: ~/reports
+  statutory-audit:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Run statutory audit
+          working_directory: ~/project/statutory
+          command: npm audit --production
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: The audit check for statutory module in `$CIRCLE_PROJECT_REPONAME` has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  statutory-docker-build-and-push:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run:
+          name: Install monorepo workspace dependencies
+          command: npm install --ignore-scripts
+      - run:
+          name: Run semantic-release for statutory
+          working_directory: ~/project/statutory
+          command: npm run semantic-release
+      - run:
+          name: Set up Docker Buildx for multi-platform builds
+          command: |
+            docker buildx create --name multiarch --use
+            docker buildx inspect --bootstrap
+      - run:
+          name: Export PACKAGE_VERSION for statutory
+          command: echo "export PACKAGE_VERSION=$(git tag --list 'statutory@*' --sort=-v:refname | head -1 | sed 's/statutory@//')" >> "$BASH_ENV"
+      - run:
+          name: Build and push statutory Docker image (multi-platform)
+          working_directory: ~/project/statutory
+          command: |
+            printf '%s\n' "$DOCKER_PASSWORD" | docker login --username "$DOCKER_LOGIN" --password-stdin
+            # TODO: re-enable provenance and sbom once Docker has been updated
+            docker buildx build --provenance=false --sbom=false --platform linux/amd64,linux/arm64 \
+              --build-arg PACKAGE_VERSION=$PACKAGE_VERSION \
+              --tag aegee/statutory:$PACKAGE_VERSION \
+              --tag aegee/statutory:latest \
+              -f docker/statutory/Dockerfile \
+              --push .
+      - slack/notify:
+          event: pass
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: The Docker image for statutory module with tags `$PACKAGE_VERSION` and `latest` has been pushed to Dockerhub."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":octagonal_sign: The Docker image for statutory module build and push has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  summeruniversity-db-recreate:
+    docker:
+      - image: cimg/node:22.22.0
+      - image: cimg/postgres:17.6
+        environment:
+          POSTGRES_PASSWORD: config.test.postgres.password
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/summeruniversity
+          override-ci-command: npm ci --legacy-peer-deps
+      - run:
+          name: Run summeruniversity db:recreate
+          working_directory: ~/project/summeruniversity
+          command: NODE_ENV=test npm run db:setup
+  summeruniversity-build:
+    docker:
+      - image: cimg/base:2025.12
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run: docker-compose -f summeruniversity/docker/docker-compose.yml -f summeruniversity/docker/docker-compose.dev.yml build --no-cache summeruniversity
+  summeruniversity-eslint:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+          app-dir: ~/project/summeruniversity
+          override-ci-command: npm ci --legacy-peer-deps
+      - run: mkdir -p ~/reports
+      - run:
+          name: Run summeruniversity eslint
+          working_directory: ~/project/summeruniversity
+          command: npm run lint -- --format junit --output-file ~/reports/eslint.xml
+      - store_test_results:
+          path: ~/reports
+      - store_artifacts:
+          path: ~/reports
+  summeruniversity-audit:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - run:
+          name: Run summeruniversity audit
+          working_directory: ~/project/summeruniversity
+          command: npm audit --production
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":x: The audit check for summeruniversity module in `$CIRCLE_PROJECT_REPONAME` has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+  summeruniversity-docker-build-and-push:
+    docker:
+      - image: cimg/node:22.22.0
+    resource_class: large
+    steps:
+      - checkout
+      - setup_remote_docker:
+          version: default
+      - run:
+          name: Install monorepo workspace dependencies
+          command: npm install --ignore-scripts
+      - run:
+          name: Run semantic-release for summeruniversity
+          working_directory: ~/project/summeruniversity
+          command: npm run semantic-release
+      - run:
+          name: Set up Docker Buildx for multi-platform builds
+          command: |
+            docker buildx create --name multiarch --use
+            docker buildx inspect --bootstrap
+      - run:
+          name: Export PACKAGE_VERSION for summeruniversity
+          command: echo "export PACKAGE_VERSION=$(git tag --list 'summeruniversity@*' --sort=-v:refname | head -1 | sed 's/summeruniversity@//')" >> "$BASH_ENV"
+      - run:
+          name: Build and push summeruniversity Docker image (multi-platform)
+          working_directory: ~/project/summeruniversity
+          command: |
+            printf '%s\n' "$DOCKER_PASSWORD" | docker login --username "$DOCKER_LOGIN" --password-stdin
+            # TODO: re-enable provenance and sbom once Docker has been updated
+            docker buildx build --provenance=false --sbom=false --platform linux/amd64,linux/arm64 \
+              --build-arg PACKAGE_VERSION=$PACKAGE_VERSION \
+              --tag aegee/summeruniversity:$PACKAGE_VERSION \
+              --tag aegee/summeruniversity:latest \
+              -f docker/summeruniversity/Dockerfile \
+              --push .
+      - slack/notify:
+          event: pass
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":white_check_mark: The Docker image for summeruniversity module with tags `$PACKAGE_VERSION` and `latest` has been pushed to Dockerhub."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
+      - slack/notify:
+          event: fail
+          custom: |
+            {
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": ":octagonal_sign: The Docker image for summeruniversity module build and push has failed."
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Project*\n$CIRCLE_PROJECT_REPONAME"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Job Number*\n$CIRCLE_BUILD_NUM"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "Visit Job"
+                      },
+                      "url": "${CIRCLE_BUILD_URL}"
+                    }
+                  ]
+                }
+              ]
+            }
 workflows:
-  version: 2
   lint-yaml:
     jobs:
       - yamllint
@@ -39,5 +2295,265 @@ workflows:
       - pylint
   lint-dockerfile:
     jobs:
-      - docker/hadolint:
-          dockerfiles: $(find . -name '*Dockerfile*')
+      - hadolint
+  core-linters:
+    jobs:
+      - core-eslint
+  core-build:
+    jobs:
+      - core-build:
+          filters:
+            branches:
+              ignore: stable
+      - core-db-recreate
+  core-test:
+    jobs:
+      - core-test
+  core-docker-build-and-push:
+    jobs:
+      - core-docker-build-and-push:
+          filters:
+            branches:
+              only: stable
+  core-audit:
+    triggers:
+      - schedule:
+          cron: "0 0 * * 5"
+          filters:
+            branches:
+              only: stable
+    jobs:
+      - core-audit
+  discounts-linters:
+    jobs:
+      - discounts-eslint
+  discounts-build:
+    jobs:
+      - discounts-build:
+          filters:
+            branches:
+              ignore: stable
+  discounts-test:
+    jobs:
+      - discounts-test
+  discounts-docker-build-and-push:
+    jobs:
+      - discounts-docker-build-and-push:
+          filters:
+            branches:
+              only: stable
+  discounts-audit:
+    triggers:
+      - schedule:
+          cron: "0 0 * * 5"
+          filters:
+            branches:
+              only: stable
+    jobs:
+      - discounts-audit
+  events-linters:
+    jobs:
+      - events-eslint
+  events-build:
+    jobs:
+      - events-build:
+          filters:
+            branches:
+              ignore: stable
+      - events-db-recreate
+  events-test:
+    jobs:
+      - events-test
+  events-docker-build-and-push:
+    jobs:
+      - events-docker-build-and-push:
+          filters:
+            branches:
+              only: stable
+  events-audit:
+    triggers:
+      - schedule:
+          cron: "0 0 * * 5"
+          filters:
+            branches:
+              only: stable
+    jobs:
+      - events-audit
+  frontend-linters:
+    jobs:
+      - frontend-eslint
+  frontend-build:
+    jobs:
+      - frontend-build:
+          filters:
+            branches:
+              ignore: stable
+  frontend-docker-build-and-push:
+    jobs:
+      - frontend-docker-build-and-push:
+          filters:
+            branches:
+              only: stable
+  frontend-audit:
+    triggers:
+      - schedule:
+          cron: "0 0 * * 5"
+          filters:
+            branches:
+              only: stable
+    jobs:
+      - frontend-audit
+  knowledge-linters:
+    jobs:
+      - knowledge-eslint
+  knowledge-build:
+    jobs:
+      - knowledge-build:
+          filters:
+            branches:
+              ignore: stable
+  knowledge-test:
+    jobs:
+      - knowledge-test
+  knowledge-docker-build-and-push:
+    jobs:
+      - knowledge-docker-build-and-push:
+          filters:
+            branches:
+              only: stable
+  knowledge-audit:
+    triggers:
+      - schedule:
+          cron: "0 0 * * 5"
+          filters:
+            branches:
+              only: stable
+    jobs:
+      - knowledge-audit
+  network-linters:
+    jobs:
+      - network-eslint
+  network-build:
+    jobs:
+      - network-build:
+          filters:
+            branches:
+              ignore: stable
+  network-test:
+    jobs:
+      - network-test
+  network-docker-build-and-push:
+    jobs:
+      - network-docker-build-and-push:
+          filters:
+            branches:
+              only: stable
+  network-audit:
+    triggers:
+      - schedule:
+          cron: "0 0 * * 5"
+          filters:
+            branches:
+              only: stable
+    jobs:
+      - network-audit
+  statutory-linters:
+    jobs:
+      - statutory-eslint
+  statutory-build:
+    jobs:
+      - statutory-build:
+          filters:
+            branches:
+              ignore: stable
+  statutory-test:
+    jobs:
+      - statutory-test
+  statutory-docker-build-and-push:
+    jobs:
+      - statutory-docker-build-and-push:
+          filters:
+            branches:
+              only: stable
+  statutory-audit:
+    triggers:
+      - schedule:
+          cron: "0 0 * * 5"
+          filters:
+            branches:
+              only: stable
+    jobs:
+      - statutory-audit
+  gsuite-wrapper-linters:
+    jobs:
+      - gsuite-wrapper-eslint
+  gsuite-wrapper-build:
+    jobs:
+      - gsuite-wrapper-build:
+          filters:
+            branches:
+              ignore: stable
+  gsuite-wrapper-test:
+    jobs:
+      - gsuite-wrapper-test
+  gsuite-wrapper-docker-build-and-push:
+    jobs:
+      - gsuite-wrapper-docker-build-and-push:
+          filters:
+            branches:
+              only: stable
+  gsuite-wrapper-audit:
+    triggers:
+      - schedule:
+          cron: "0 0 * * 5"
+          filters:
+            branches:
+              only: stable
+    jobs:
+      - gsuite-wrapper-audit
+  mailer-build:
+    jobs:
+      - mailer-build:
+          filters:
+            branches:
+              ignore: stable
+  mailer-test:
+    jobs:
+      - mailer-test
+  mailer-docker-build-and-push:
+    jobs:
+      - mailer-docker-build-and-push:
+          filters:
+            branches:
+              only: stable
+  summeruniversity-linters:
+    jobs:
+      - summeruniversity-eslint
+  summeruniversity-build:
+    jobs:
+      - summeruniversity-build:
+          filters:
+            branches:
+              ignore: stable
+      - summeruniversity-db-recreate
+  summeruniversity-docker-build-and-push:
+    jobs:
+      - summeruniversity-docker-build-and-push:
+          filters:
+            branches:
+              only: stable
+  summeruniversity-audit:
+    triggers:
+      - schedule:
+          cron: "0 0 * * 5"
+          filters:
+            branches:
+              only: stable
+    jobs:
+      - summeruniversity-audit
+  nginx-static-docker-build-and-push:
+    jobs:
+      - nginx-static-docker-build-and-push:
+          filters:
+            branches:
+              only: stable
